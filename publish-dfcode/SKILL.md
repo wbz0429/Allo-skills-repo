@@ -3,6 +3,51 @@ name: publish-dfcode
 description: 发布 dfcode 到 npm。支持正式版和 beta 版。会自动拉取 feature/dev 最新代码、构建所有平台二进制、打包并发布到 npm。
 ---
 
+## 环境要求
+
+执行此 skill 前需确保以下条件已满足：
+
+### 1. 克隆 dfcode 源码
+
+```bash
+git clone git@github.com:wbz0429/dfcode.git
+cd dfcode
+```
+
+后续所有命令在 `packages/dfcode` 子目录下执行。
+
+### 2. Git 权限
+
+需要有 dfcode 仓库的读写权限（当前 owner: wbz0429）。如果是团队其他成员，需要先被添加为仓库 collaborator。
+
+### 3. npm 发布权限
+
+需要有 npm 包 `dfcode` 的 publish 权限。**使用 wbz0429 的 npm token：**
+
+```bash
+npm config set //registry.npmjs.org/:_authToken <wbz0429的npm_token>
+```
+
+或临时设置环境变量：
+
+```bash
+export NPM_TOKEN=<wbz0429的npm_token>
+```
+
+> npm 账号 wbz0429 拥有 `dfcode`、`dfcode-darwin-arm64`、`dfcode-darwin-x64`、`dfcode-linux-x64`、`dfcode-linux-arm64`、`dfcode-windows-x64` 六个包的发布权限。
+
+### 4. 工具依赖
+
+- **bun** — 依赖安装和构建
+- **npm** — 打包（`npm pack`）和发布（`npm publish`）
+
+确认已安装：
+
+```bash
+bun --version
+npm --version
+```
+
 ## 使用方式
 
 - `/publish-dfcode` — 发布正式版（latest tag）

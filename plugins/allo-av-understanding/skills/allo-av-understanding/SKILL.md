@@ -1,9 +1,13 @@
 ---
 name: allo-av-understanding
 description: Use the Allo audio/video understanding HTTP API to submit media files, poll asynchronous jobs, retrieve ASR/OCR timeline evidence, generate summaries, translate extracted evidence, and answer questions grounded in video evidence. Use when the user asks to analyze, summarize, transcribe, OCR, query, or inspect an audio/video file or an existing job_id.
-tools: []
-version: "1.0.0"
-author: lemon7Cy
+metadata:
+  version: "1.0.0"
+  author: lemon7Cy
+dependency:
+  ffprobe: ">=4.0"
+  curl: "*"
+  python3: ">=3.6"
 ---
 
 # Allo Audio/Video Understanding

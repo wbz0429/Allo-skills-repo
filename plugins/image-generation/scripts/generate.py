@@ -1,126 +1,271 @@
+import argparse
 import base64
+import binascii
+import http.client
+import json
 import os
-import base64
+import re
+import sys
+import tempfile
+import urllib.error
+import urllib.request
 from pathlib import Path
+from typing import Any
 
-import requests
-from dotenv import load_dotenv
-from PIL import Image
-
-
-REQUEST_TIMEOUT = (10, 120)
-
-_ROOT_DIR = Path(__file__).resolve().parents[4]
-load_dotenv(_ROOT_DIR / ".env")
-load_dotenv(_ROOT_DIR / "backend/.env", override=True)
-
-
-def _save_base64_image(base64_image: str, output_file: str) -> str:
-    with open(output_file, "wb") as f:
-        f.write(base64.b64decode(base64_image))
-    return f"Successfully generated image to {output_file}"
-
-
-def _try_gemini_proxy(payload: dict, output_file: str) -> str | None:
-    proxy_base_url = os.getenv("GEMINI_IMAGE_BASE_URL")
-    proxy_api_key = os.getenv("GEMINI_IMAGE_API_KEY")
-    if not (proxy_base_url and proxy_api_key):
-        return None
-
-    model_name = os.getenv("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image")
-    response = requests.post(
-        f"{proxy_base_url.rstrip('/')}/v1beta/models/{model_name}:generateContent",
-        headers={
-            "Authorization": f"Bearer {proxy_api_key}",
-            "Content-Type": "application/json",
-        },
-        json=payload,
-        timeout=REQUEST_TIMEOUT,
-    )
-    response.raise_for_status()
-    json_response = response.json()
-    parts: list[dict] = json_response["candidates"][0]["content"]["parts"]
-    image_parts = [part for part in parts if part.get("inlineData", False)]
-    if len(image_parts) == 1:
-        return _save_base64_image(image_parts[0]["inlineData"]["data"], output_file)
-    raise Exception("Gemini proxy did not return image data")
+REQUEST_TIMEOUT = (10, 330)
+DEFAULT_BASE_URL = "http://221.0.79.252:18120/v1"
+IMAGE_MODEL = "gpt-image-2"
+MAX_PROMPT_LENGTH = 10_000
+ASPECT_RATIO_SIZES = {
+    "1:1": "1024x1024",
+    "square": "1024x1024",
+    "portrait": "1024x1792",
+    "9:16": "1024x1792",
+    "2:3": "1024x1792",
+    "landscape": "1792x1024",
+    "16:9": "1792x1024",
+    "3:2": "1792x1024",
+}
+MAX_PROVIDER_ERROR_LENGTH = 2000
+SECRET_FIELD_NAMES = (
+    "api[_-]?key|access[_-]?token|token|key|signature|sig|password|authorization"
+)
 
 
-def _try_gemini_official(payload: dict, output_file: str) -> str | None:
-    api_key = os.getenv("GEMINI_API_KEY")
+def _load_config() -> tuple[str, str]:
+    api_key = os.getenv("IMAGE_GATEWAY_KEY", "").strip()
     if not api_key:
-        return None
+        raise RuntimeError(
+            "IMAGE_GATEWAY_KEY is required. Set it before running image generation."
+        )
 
-    if os.getenv("GEMINI_IMAGE_BASE_URL") or os.getenv("ARK_API_KEY"):
-        return None
+    base_url = os.getenv("IMAGE_GATEWAY_BASE_URL", DEFAULT_BASE_URL).strip().rstrip("/")
+    if not base_url:
+        raise RuntimeError("IMAGE_GATEWAY_BASE_URL cannot be empty.")
 
-    response = requests.post(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro-image-preview:generateContent",
-        headers={
-            "x-goog-api-key": api_key,
-            "Content-Type": "application/json",
-        },
-        json=payload,
-        timeout=REQUEST_TIMEOUT,
-    )
-    response.raise_for_status()
-    json_response = response.json()
-    parts: list[dict] = json_response["candidates"][0]["content"]["parts"]
-    image_parts = [part for part in parts if part.get("inlineData", False)]
-    if len(image_parts) == 1:
-        return _save_base64_image(image_parts[0]["inlineData"]["data"], output_file)
-    raise Exception("Official Gemini did not return image data")
+    return api_key, base_url
 
 
-def _try_seedream(prompt: str, output_file: str) -> str | None:
-    ark_api_key = os.getenv("ARK_API_KEY")
-    if not ark_api_key:
-        return None
-
-    response = requests.post(
-        "https://ark.cn-beijing.volces.com/api/v3/images/generations",
-        headers={
-            "Authorization": f"Bearer {ark_api_key}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": os.getenv("SEEDREAM_MODEL", "doubao-seedream-5-0-260128"),
-            "prompt": prompt,
-            "response_format": "url",
-            "size": os.getenv("SEEDREAM_SIZE", "2048x2048"),
-        },
-        timeout=REQUEST_TIMEOUT,
-    )
-    response.raise_for_status()
-    json_response = response.json()
-    image_url = json_response["data"][0]["url"]
-    image_response = requests.get(image_url, timeout=REQUEST_TIMEOUT)
-    image_response.raise_for_status()
-    with open(output_file, "wb") as f:
-        f.write(image_response.content)
-    return f"Successfully generated image to {output_file}"
-
-
-def validate_image(image_path: str) -> bool:
-    """
-    Validate if an image file can be opened and is not corrupted.
-
-    Args:
-        image_path: Path to the image file
-
-    Returns:
-        True if the image is valid and can be opened, False otherwise
-    """
+def _size_for_aspect_ratio(aspect_ratio: str) -> str:
+    normalized = aspect_ratio.strip().lower()
     try:
-        with Image.open(image_path) as img:
-            img.verify()  # Verify that it's a valid image
-        # Re-open to check if it can be fully loaded (verify() may not catch all issues)
-        with Image.open(image_path) as img:
-            img.load()  # Force load the image data
-        return True
-    except Exception as e:
-        print(f"Warning: Image '{image_path}' is invalid or corrupted: {e}")
-        return False
+        return ASPECT_RATIO_SIZES[normalized]
+    except KeyError as exc:
+        supported = ", ".join(ASPECT_RATIO_SIZES)
+        raise ValueError(
+            f"Unsupported aspect ratio '{aspect_ratio}'. Supported values: {supported}."
+        ) from exc
+
+
+def _require_file(path_value: str, kind: str) -> Path:
+    path = Path(path_value).expanduser()
+    if not path.is_file():
+        raise FileNotFoundError(f"The {kind} file does not exist: {path}")
+    return path
+
+
+def _sanitize_provider_text(text: str, api_key: str) -> str:
+    sanitized = text.replace(api_key, "[REDACTED]") if api_key else text
+    sanitized = re.sub(
+        rf"(?i)(?P<key_quote>[\"'])(?P<key>{SECRET_FIELD_NAMES})(?P=key_quote)(?P<separator>\s*:\s*)(?P<value_quote>[\"'])(?P<value>.*?)(?P=value_quote)",
+        lambda match: (
+            f"{match.group('key_quote')}{match.group('key')}{match.group('key_quote')}{match.group('separator')}{match.group('value_quote')}[REDACTED]{match.group('value_quote')}"
+        ),
+        sanitized,
+    )
+    sanitized = re.sub(
+        r"(?i)(\bauthorization\s*:\s*)(?:(?:basic|bearer|digest|negotiate|token)\s+)?[^\s,;\"'}\]]+",
+        r"\1[REDACTED]",
+        sanitized,
+    )
+    sanitized = re.sub(
+        rf"(?i)([?&](?:{SECRET_FIELD_NAMES})=)[^&\s\"']+",
+        r"\1[REDACTED]",
+        sanitized,
+    )
+    if len(sanitized) > MAX_PROVIDER_ERROR_LENGTH:
+        return f"{sanitized[:MAX_PROVIDER_ERROR_LENGTH]}... [truncated]"
+    return sanitized
+
+
+def _request_error(action: str, exc: BaseException, api_key: str) -> RuntimeError:
+    details = _sanitize_provider_text(str(exc), api_key)
+    return RuntimeError(f"{action}: {details}" if details else action)
+
+
+class _ReadTimeoutHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, *args, read_timeout: int, **kwargs):
+        self.read_timeout = read_timeout
+        super().__init__(*args, **kwargs)
+
+    def connect(self) -> None:
+        super().connect()
+        self.sock.settimeout(self.read_timeout)
+
+
+class _ReadTimeoutHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, *args, read_timeout: int, **kwargs):
+        self.read_timeout = read_timeout
+        super().__init__(*args, **kwargs)
+
+    def connect(self) -> None:
+        super().connect()
+        self.sock.settimeout(self.read_timeout)
+
+
+class _ReadTimeoutHTTPHandler(urllib.request.HTTPHandler):
+    def __init__(self, read_timeout: int):
+        self.read_timeout = read_timeout
+        super().__init__()
+
+    def http_open(self, req):
+        connection = lambda *args, **kwargs: _ReadTimeoutHTTPConnection(
+            *args, read_timeout=self.read_timeout, **kwargs
+        )
+        return self.do_open(connection, req)
+
+
+class _ReadTimeoutHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, read_timeout: int):
+        self.read_timeout = read_timeout
+        super().__init__()
+
+    def https_open(self, req):
+        connection = lambda *args, **kwargs: _ReadTimeoutHTTPSConnection(
+            *args, read_timeout=self.read_timeout, **kwargs
+        )
+        return self.do_open(connection, req)
+
+
+def _urlopen(request: urllib.request.Request, timeout: tuple[int, int]):
+    opener = urllib.request.build_opener(
+        _ReadTimeoutHTTPHandler(timeout[1]),
+        _ReadTimeoutHTTPSHandler(timeout[1]),
+    )
+    return opener.open(request, timeout=timeout[0])
+
+
+def _read_response(request: urllib.request.Request) -> tuple[int, bytes]:
+    try:
+        response = _urlopen(request, REQUEST_TIMEOUT)
+        with response:
+            return response.getcode(), response.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read(MAX_PROVIDER_ERROR_LENGTH + 1)
+
+
+def _request_bytes(
+    request: urllib.request.Request,
+    action: str,
+    api_key: str,
+) -> bytes:
+    try:
+        status_code, body = _read_response(request)
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise _request_error(action, exc, api_key) from exc
+    if status_code >= 400:
+        details = _sanitize_provider_text(
+            body.decode("utf-8", errors="replace").strip(), api_key
+        )
+        suffix = f" Provider response: {details}" if details else ""
+        raise RuntimeError(
+            f"Image gateway {'download' if action.startswith('Failed to download') else 'request'} failed with HTTP {status_code}.{suffix}"
+        )
+    return body
+
+
+def _response_item(body: bytes) -> dict[str, Any]:
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Image API returned invalid JSON.") from exc
+
+    try:
+        item = payload["data"][0]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError(
+            "Image API response must contain a non-empty data array."
+        ) from exc
+    if not isinstance(item, dict):
+        raise RuntimeError("Image API data[0] must be an object.")
+    return item
+
+
+def _image_bytes(response_body: bytes, api_key: str) -> bytes:
+    item = _response_item(response_body)
+    encoded = item.get("b64_json")
+    if encoded:
+        try:
+            return base64.b64decode(encoded, validate=True)
+        except (binascii.Error, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "Image API returned invalid b64_json image data."
+            ) from exc
+
+    image_url = item.get("url")
+    if image_url:
+        request = urllib.request.Request(image_url, method="GET")
+        content = _request_bytes(
+            request, "Failed to download generated image URL", api_key
+        )
+        if not content:
+            raise RuntimeError("Generated image URL returned an empty response body.")
+        return content
+
+    raise RuntimeError("Image API data[0] must contain b64_json or url.")
+
+
+def _authorization_headers(api_key: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {api_key}"}
+
+
+def _post_generation(
+    base_url: str,
+    api_key: str,
+    model: str,
+    prompt: str,
+    size: str,
+) -> bytes:
+    body = json.dumps(
+        {
+            "model": model,
+            "prompt": prompt,
+            "size": size,
+            "n": 1,
+        }
+    ).encode("utf-8")
+    headers = _authorization_headers(api_key)
+    headers["Content-Type"] = "application/json"
+    headers["Accept"] = "application/json"
+    request = urllib.request.Request(
+        f"{base_url}/images/generations",
+        data=body,
+        headers=headers,
+        method="POST",
+    )
+    return _request_bytes(request, "Could not reach the image API", api_key)
+
+
+def _atomic_write(output_path: Path, image_bytes: bytes) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=output_path.parent,
+            prefix=f".{output_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+            temporary_file.write(image_bytes)
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+        os.replace(temporary_path, output_path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 def generate_image(
@@ -129,99 +274,71 @@ def generate_image(
     output_file: str,
     aspect_ratio: str = "16:9",
 ) -> str:
-    with open(prompt_file, "r", encoding="utf-8") as f:
-        prompt = f.read()
-    parts = []
-    i = 0
-
-    # Filter out invalid reference images
-    valid_reference_images = []
-    for ref_img in reference_images:
-        if validate_image(ref_img):
-            valid_reference_images.append(ref_img)
-        else:
-            print(f"Skipping invalid reference image: {ref_img}")
-
-    if len(valid_reference_images) < len(reference_images):
-        print(
-            f"Note: {len(reference_images) - len(valid_reference_images)} reference image(s) were skipped due to validation failure."
+    if reference_images:
+        raise ValueError(
+            "The current DFCode image gateway does not support image editing or reference images."
         )
-
-    for reference_image in valid_reference_images:
-        i += 1
-        with open(reference_image, "rb") as f:
-            image_b64 = base64.b64encode(f.read()).decode("utf-8")
-        parts.append(
-            {
-                "inlineData": {
-                    "mimeType": "image/jpeg",
-                    "data": image_b64,
-                }
-            }
+    api_key, base_url = _load_config()
+    prompt_path = _require_file(prompt_file, "prompt")
+    prompt = prompt_path.read_text(encoding="utf-8")
+    if not prompt.strip():
+        raise ValueError(f"The prompt file is empty: {prompt_path}")
+    if len(prompt) > MAX_PROMPT_LENGTH:
+        raise ValueError(
+            f"The image prompt exceeds the maximum length of {MAX_PROMPT_LENGTH:,} characters."
         )
+    size = _size_for_aspect_ratio(aspect_ratio)
+    response_body = _post_generation(base_url, api_key, IMAGE_MODEL, prompt, size)
 
-    payload = {
-        "generationConfig": {"imageConfig": {"aspectRatio": aspect_ratio}},
-        "contents": [{"role": "user", "parts": [*parts, {"text": prompt}]}],
-    }
+    image_bytes = _image_bytes(response_body, api_key)
+    output_path = Path(output_file).expanduser()
+    _atomic_write(output_path, image_bytes)
+    return f"Successfully generated image to {output_path.resolve()}"
 
-    errors: list[str] = []
 
-    for provider_name, provider in [
-        ("gemini_proxy", lambda: _try_gemini_proxy(payload, output_file)),
-        ("gemini_official", lambda: _try_gemini_official(payload, output_file)),
-        ("seedream", lambda: _try_seedream(prompt, output_file)),
-    ]:
-        try:
-            result = provider()
-            if result:
-                return result
-        except Exception as e:
-            errors.append(f"{provider_name}: {e}")
-
-    raise Exception(
-        "All image providers failed: "
-        + " | ".join(errors or ["no provider configured"])
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Generate images using the DFCode image gateway"
     )
-
-
-if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description="Generate images using Gemini API")
     parser.add_argument(
         "--prompt-file",
         required=True,
-        help="Absolute path to JSON prompt file",
+        help="Path to a UTF-8 prompt file",
     )
     parser.add_argument(
         "--reference-images",
         nargs="*",
         default=[],
-        help="Absolute paths to reference images (space-separated)",
+        help="Paths to reference images (space-separated)",
     )
     parser.add_argument(
         "--output-file",
         required=True,
-        help="Output path for generated image",
+        help="Output path for the generated image",
     )
     parser.add_argument(
         "--aspect-ratio",
-        required=False,
         default="16:9",
-        help="Aspect ratio of the generated image",
+        help="Output ratio: 1:1, portrait, landscape, 16:9, 9:16, 2:3, or 3:2",
     )
+    return parser
 
-    args = parser.parse_args()
 
+def main() -> int:
+    args = _build_parser().parse_args()
     try:
-        print(
-            generate_image(
-                args.prompt_file,
-                args.reference_images,
-                args.output_file,
-                args.aspect_ratio,
-            )
+        result = generate_image(
+            args.prompt_file,
+            args.reference_images,
+            args.output_file,
+            args.aspect_ratio,
         )
-    except Exception as e:
-        print(f"Error while generating image: {e}")
+    except Exception as exc:
+        print(f"Image generation failed: {exc}", file=sys.stderr)
+        return 1
+    print(result)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

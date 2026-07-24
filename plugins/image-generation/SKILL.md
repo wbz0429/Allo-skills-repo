@@ -1,147 +1,67 @@
 ---
 name: image-generation
-description: Use this skill when the user requests to generate, create, imagine, or visualize images including characters, scenes, products, or any visual content. Supports text-to-image and image editing via MaaS platform gpt-image-2 API.
-tools: []
-version: "2.0.0"
-author: allo-official
+description: Generate new images with gpt-image-2 through the shared DFCode image gateway. Use when the user asks to generate, draw, render, design, or create an image; do not use for image search, editing, or reference-image requests.
+version: 4.0.4
 required_env:
-  - GPT_IMAGE_API_KEY
-optional_env: []
+  - IMAGE_GATEWAY_KEY
+optional_env:
+  - IMAGE_GATEWAY_BASE_URL
 credentials:
-  - key: GPT_IMAGE_API_KEY
-    label: GPT Image 2 API Key
-    description: 用于调用 MaaS 平台 gpt-image-2 生图和编辑接口的认证 key。
+  - key: IMAGE_GATEWAY_KEY
+    label: DFCode Image Gateway Key
     required: true
     secret: true
 ---
 
-# Image Generation Skill
+# Image Generation
 
-## Overview
+Use this skill when the user asks to generate, draw, render, design, or create a new image. Do not call `image_search` for a generation request. The current gateway supports generation only; it does not support editing or reference images.
 
-Generate or edit images via the MaaS platform using `gpt-image-2`. Supports text-to-image generation and image editing with reference images.
+## Required Workflow
 
-## Runtime Paths
+Follow this order exactly:
 
-The Agent context should provide the absolute path to this `SKILL.md`. Derive bundled files from that path instead of using fixed virtual mount paths:
+1. Write a complete UTF-8 prompt containing the subject, style, composition, lighting, palette, and exclusions.
+2. Keep the prompt non-empty and at most 10,000 characters.
+3. Save the prompt under the current workspace.
+4. Run `scripts/generate.py` from this skill directory.
+5. Do not pass `--reference-images`.
+6. Prefer a `.png` output filename for `gpt-image-2` output.
+7. Run the generation command exactly once for each user request. Do not immediately retry a timeout because the upstream Image 2 request may still complete after the local caller disconnects.
+8. Treat generation as successful only if the command exits with code 0, stdout contains `Successfully generated image to <absolute path>`, and that exact output file exists and is non-empty.
+9. Call `present_files` with a one-item `filepaths` list containing that exact absolute output path.
+10. Claim that the image was generated only after `present_files` returns `Successfully presented files`.
 
-```bash
-SKILL_DIR="$(cd "$(dirname "$SKILL_MD_PATH")" && pwd)"
-WORKSPACE_DIR="${WORKSPACE_DIR:-$PWD/workspace}"
-OUTPUT_DIR="${OUTPUT_DIR:-$PWD/outputs}"
-UPLOAD_DIR="${UPLOAD_DIR:-$PWD/uploads}"
-```
+If any check or the `present_files` call fails, report the failure honestly. Never say “已生成”, “生成完成”, “image is ready”, or an equivalent success claim without both generation and presentation proof.
 
-Create output directories if needed.
-
-## API Reference
-
-| Operation | Endpoint | Method |
-|-----------|----------|--------|
-| Generate | `http://221.0.79.251:8080/v1/images/generations` | `POST` |
-| Edit | `http://221.0.79.251:8080/v1/images/edits` | `POST` |
-
-| Parameter | Description | Values |
-|-----------|-------------|--------|
-| `model` | Model name | `gpt-image-2` (required) |
-| `prompt` | Text prompt | Required |
-| `n` | Number of images | Default `1` |
-| `size` | Image dimensions | `1024x1024`, `1024x1792`, `1792x1024` |
-| `response_format` | Return format | `b64_json` (default), `url` |
-| `quality` | Quality level | `standard`, `hd` |
-| `style` | Style | `vivid`, `natural` |
-| `stream` | Streaming | `true`, `false` |
-
-## Workflow
-
-### Step 1: Understand Requirements
-
-When a user requests image generation, identify:
-
-- Subject/content: What should be in the image
-- Style preferences: Art style, mood, color palette
-- Technical specs: Aspect ratio, composition, lighting
-- Reference images: Any images to guide generation (use edit endpoint)
-- Size: Match the content type (portrait → `1024x1792`, landscape → `1792x1024`)
-
-### Step 2: Generate Image
+## Invocation
 
 ```bash
-curl -s http://221.0.79.251:8080/v1/images/generations \
-  -H "Authorization: Bearer $GPT_IMAGE_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "gpt-image-2",
-    "prompt": "YOUR_PROMPT_HERE",
-    "n": 1,
-    "size": "1024x1024",
-    "response_format": "b64_json",
-    "quality": "standard",
-    "style": "vivid"
-  }'
+python3 scripts/generate.py \
+  --prompt-file /path/to/workspace/prompt.txt \
+  --output-file /path/to/outputs/generated-image.png \
+  --aspect-ratio 16:9
 ```
 
-### Step 3: Edit Image (with reference)
+Resolve `scripts/generate.py` relative to this skill directory. Do not hard-code a machine-specific skill path.
 
-```bash
-curl -s http://221.0.79.251:8080/v1/images/edits \
-  -H "Authorization: Bearer $GPT_IMAGE_API_KEY" \
-  -F "image=@$UPLOAD_DIR/input.png" \
-  -F "prompt=YOUR_EDIT_PROMPT" \
-  -F "model=gpt-image-2"
-```
+## Configuration
 
-### Step 4: Save Output
+- `IMAGE_GATEWAY_KEY` is required and must be injected from secret storage.
+- `IMAGE_GATEWAY_BASE_URL` defaults to `http://221.0.79.252:18120/v1`.
+- The model is fixed to `gpt-image-2` and cannot be changed through environment variables or command-line options.
+- Do not substitute, fall back to, or retry with any other image-generation model. Report the failure if `gpt-image-2` is unavailable.
+- The script allows up to 330 seconds for Image 2 to return, exceeding the gateway's 300-second upstream timeout.
 
-Decode `b64_json` response and save:
+## Parameters
 
-```bash
-RESPONSE=$(curl -s http://221.0.79.251:8080/v1/images/generations \
-  -H "Authorization: Bearer $GPT_IMAGE_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"gpt-image-2","prompt":"A cute cat","response_format":"b64_json"}')
+- `--prompt-file`: Required UTF-8 prompt file.
+- `--output-file`: Required output path; prefer `.png` for `gpt-image-2`.
+- `--aspect-ratio`: `1:1`, `square`, `portrait`, `9:16`, `2:3`, `landscape`, `16:9`, or `3:2`.
+- `--reference-images`: Unsupported. Do not pass this option with any files.
 
-echo "$RESPONSE" | python3 -c "
-import sys, json, base64
-data = json.load(sys.stdin)
-img = base64.b64decode(data['data'][0]['b64_json'])
-with open('$OUTPUT_DIR/generated.png', 'wb') as f:
-    f.write(img)
-"
-```
+## Failure Contract
 
-## Prompt Engineering Tips
+If the command fails, the success line is missing, the output file is empty, or `present_files` fails, report the error and do not claim that an image was generated. If the failure is a timeout, do not run the command again in the same turn; the upstream request may still be completing, and an immediate retry can duplicate generation work. Do not print Base64 response data or authentication values. Decline reference-image editing requests because the current gateway supports generation only.
 
-- Always write prompts in English for best results
-- Be specific about style, lighting, composition
-- Include negative concepts by describing what you DON'T want
-- Use `quality: "hd"` for detailed or professional images
-- Use `style: "natural"` for realistic photos, `vivid` for artistic
-
-## Common Scenarios
-
-**Character Design**: Describe gender, age, ethnicity, clothing, pose, expression, setting
-
-**Scene/Environment**: Describe location, time of day, weather, mood, atmosphere, focal points
-
-**Product Visualization**: Describe product details, materials, lighting, background, presentation angle
-
-**Illustration/Art**: Specify art style (watercolor, oil painting, digital art, anime), color palette, composition
-
-## Output Handling
-
-After generation:
-
-- Images are saved to `$OUTPUT_DIR/`
-- Share generated images with user using `present_files` tool
-- Provide brief description of the generation result
-- Offer to iterate if adjustments needed
-- `revised_prompt` in response shows how the model interpreted your prompt
-
-## Common Mistakes
-
-- Forgetting `response_format` — defaults to `b64_json`, not `url`
-- Using unsupported sizes — stick to `1024x1024`, `1024x1792`, `1792x1024`
-- Missing `model` field — it's required
-- Writing prompts in non-English — always use English for best quality
-- Using generation endpoint for edits — use `/v1/images/edits` when modifying existing images
+For Doraemon-style comics, read `templates/doraemon.md` before composing the prompt.

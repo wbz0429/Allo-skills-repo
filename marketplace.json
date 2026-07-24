@@ -269,19 +269,21 @@
     },
     {
       "name": "image-generation",
-      "description": "Generate or edit images via MaaS platform gpt-image-2 API, supporting text-to-image and image editing.",
-      "version": "2.0.0",
+      "description": "Generate new images exclusively with gpt-image-2 through the shared DFCode image gateway; use for creation, not image search or editing.",
+      "version": "4.0.4",
       "category": "creative",
       "source": "./plugins/image-generation",
       "required_env": [
-        "GPT_IMAGE_API_KEY"
+        "IMAGE_GATEWAY_KEY"
       ],
-      "optional_env": [],
+      "optional_env": [
+        "IMAGE_GATEWAY_BASE_URL"
+      ],
       "credentials": [
         {
-          "key": "GPT_IMAGE_API_KEY",
-          "label": "GPT Image 2 API Key",
-          "description": "用于调用 MaaS 平台 gpt-image-2 生图和编辑接口的认证 key。",
+          "key": "IMAGE_GATEWAY_KEY",
+          "label": "DFCode Image Gateway Key",
+          "description": "用于调用共享 DFCode 图片生成网关的认证密钥。",
           "required": true,
           "secret": true
         }

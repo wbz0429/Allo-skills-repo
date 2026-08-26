@@ -1,6 +1,6 @@
 ---
 name: allo-av-understanding
-description: Use the Allo audio/video understanding HTTP API to submit media files, poll asynchronous jobs, retrieve ASR/OCR timeline evidence, generate summaries, translate extracted evidence, and answer questions grounded in video evidence. Use when the user asks to analyze, summarize, transcribe, OCR, query, or inspect an audio/video file or an existing job_id.
+description: Use the Allo audio/video understanding HTTP API to submit media files or downloadable public video URLs, poll asynchronous jobs, retrieve ASR/OCR timeline evidence, generate summaries, translate extracted evidence, answer questions grounded in video evidence, and produce evidence-based presentation or speech distillation reports.
 tools: []
 version: "1.0.0"
 author: lemon7Cy
@@ -41,19 +41,23 @@ export AV_UNDERSTANDING_BASE_URL="http://host:port"
 Use this skill when the user asks to:
 
 - Summarize an audio/video file.
+- Analyze a public short-video/share link after downloading the media file, such as a Douyin/TikTok-style share text that contains a URL.
 - Transcribe a video or meeting recording.
 - Extract OCR / screen text evidence from a video.
 - Inspect or continue an existing `job_id`.
 - Ask questions about a processed video.
 - Produce evidence with timestamps from audio/video content.
 - Evaluate, score, or review a recorded presentation, speech, report, or defense (see Workflow D for the default evaluation report).
+- Distill what a person says in an interview, podcast, talk, or social video into key claims, quotes, and timestamped takeaways (see Workflow E).
 - Build an agent capability around the audio/video understanding API.
 
-Do not use this skill for unrelated general QA, pure local ffmpeg tasks, or generic file management.
+Do not use this skill for unrelated general QA, pure local ffmpeg tasks, generic file management, private/non-public videos, or attempts to bypass login, DRM, paywalls, platform access controls, or copyright restrictions. For URL inputs, only download media that is publicly accessible and that the user is allowed to process; if downloading fails, ask the user to provide a local media file.
 
 ## Hard Rule: Remote Service Only, No Local Fallback
 
 This skill is only a thin client for the remote Allo service. The remote service is the single source of any reliable result, because only it runs the processed recognition models (ASR, OCR, visual understanding, summarization). Local or offline processing is NOT a valid substitute.
+
+Downloading a user-provided public video URL is only an acquisition step, not analysis. After download, the media must still be uploaded to the remote service and processed through the normal asynchronous job lifecycle. Never use local transcript/OCR/vision models to replace the remote service.
 
 Before doing anything else, you MUST verify service health:
 
@@ -159,8 +163,11 @@ A helper script is included:
 
 ```bash
 bash scripts/media_understanding.sh health
+bash scripts/media_understanding.sh extract-url "复制打开抖音... https://v.douyin.com/..."
+bash scripts/media_understanding.sh download-url "复制打开抖音... https://v.douyin.com/..." /tmp/allo-downloads
 bash scripts/media_understanding.sh submit /absolute/path/to/video.mp4
 bash scripts/media_understanding.sh analyze /absolute/path/to/video.mp4 auto
+bash scripts/media_understanding.sh analyze-url "复制打开抖音... https://v.douyin.com/..." auto /tmp/allo-downloads
 bash scripts/media_understanding.sh recommend-wait /absolute/path/to/video.mp4
 bash scripts/media_understanding.sh job JOB_ID
 bash scripts/media_understanding.sh poll JOB_ID 5 forever
@@ -181,6 +188,12 @@ AV_UNDERSTANDING_POLL_INTERVAL           default: 5 seconds
 AV_UNDERSTANDING_MAX_WAIT_SECONDS        default: forever (poll until done/failed while service is healthy; set a number for a hard timeout)
 AV_UNDERSTANDING_MAX_UNREACHABLE_CHECKS  default: 36 consecutive failed liveness checks before giving up
 ```
+
+URL download behavior:
+
+- Douyin URLs use `scripts/douyin_download.py`, a built-in direct downloader based on Python standard library only. It follows the public share page, extracts SSR router video metadata, resolves the play endpoint, and downloads the returned MP4. This does not require watermark removal.
+- Other URL platforms are not supported by this helper. Ask the user to provide a local media file for non-Douyin links.
+- If the built-in Douyin path fails, do not invent a transcript or use local analysis. Ask the user to upload/provide the video file directly.
 
 ## API Contract
 
@@ -210,6 +223,38 @@ Important response fields:
 - `filename`
 - `message`
 - `error`
+
+### Extract And Download Public Video URLs
+
+Use this for pasted social-share text that contains a URL, for example Douyin/TikTok-style copied text.
+
+Extract the first URL:
+
+```bash
+bash scripts/media_understanding.sh extract-url "PASTED_SHARE_TEXT"
+```
+
+Download public media to a local temporary file:
+
+```bash
+bash scripts/media_understanding.sh download-url "PASTED_SHARE_TEXT" /tmp/allo-downloads
+```
+
+Download, upload to the remote service, and wait using the normal job lifecycle:
+
+```bash
+bash scripts/media_understanding.sh analyze-url "PASTED_SHARE_TEXT" auto /tmp/allo-downloads
+```
+
+Important constraints:
+
+- The helper only extracts the URL and acquires the media file; it does not perform local transcription, OCR, summarization, or vision analysis.
+- For Douyin share links, the helper uses the direct public-share resolver: short URL -> canonical share/video page -> SSR metadata -> play endpoint -> MP4 file.
+- The direct Douyin resolver is best-effort and does not require no-watermark output. Watermarked MP4 is acceptable for downstream understanding.
+- The direct Douyin resolver is intentionally implemented as a small script instead of depending on `yt-dlp`, keeping the skill self-contained.
+- Only use this for public URLs the user is allowed to process.
+- Do not bypass login, private sharing restrictions, DRM, paywalls, or platform access controls.
+- If download fails, ask the user to provide the video file directly and then use `analyze /absolute/path/to/file.mp4 auto`.
 
 ### Query Job Status
 
@@ -413,6 +458,53 @@ The media job has been submitted and is still processing. job_id=JOB_ID. Continu
 2. Call `qa JOB_ID "question" 5`.
 3. If citations are present, answer with citations and timestamps.
 4. If QA is weak or empty, use `summary` and `timeline` as fallback evidence.
+
+### Workflow E: Public Social Video URL / Speech Distillation
+
+Use this workflow when the user provides pasted social-video share text or a URL and asks to distill what the person says, summarize an interview, extract观点, or turn a public video into key takeaways. This is a separate branch from presentation scoring: it should not force a presentation evaluation unless the content is clearly a presentation/report or the user asks for scoring.
+
+1. Run health check first. If the service is unhealthy, stop; do not download or analyze locally.
+2. Extract the URL from the pasted text:
+
+```bash
+bash scripts/media_understanding.sh extract-url "PASTED_SHARE_TEXT"
+```
+
+3. Download the public media file with the helper:
+
+```bash
+bash scripts/media_understanding.sh download-url "PASTED_SHARE_TEXT" /tmp/allo-downloads
+```
+
+4. Submit the downloaded file to the remote service and poll until `done`:
+
+```bash
+bash scripts/media_understanding.sh analyze /absolute/path/to/downloaded.mp4 auto
+```
+
+   Or use the combined helper:
+
+```bash
+bash scripts/media_understanding.sh analyze-url "PASTED_SHARE_TEXT" auto /tmp/allo-downloads
+```
+
+5. Fetch `summary` and `timeline`. Use QA only for narrow follow-up questions; broad distillation should be built from summary/timeline/ASR evidence.
+6. Produce a concise speech-distillation Markdown report by default. Recommended sections:
+   - `视频信息`: job_id, filename, duration, evidence channels.
+   - `一句话结论`: what the speaker mainly says.
+   - `核心观点`: 3-8 key claims, each with timestamp evidence when possible.
+   - `论据/例子`: supporting examples or stories from the speaker.
+   - `值得引用的原话`: short quotes only when ASR is clear enough; include timestamps and disclose ASR caveats.
+   - `时间线`: chapter-style structure.
+   - `可复用内容`: bullets suitable for notes, research, or content planning.
+   - `限制说明`: ASR/OCR/visual quality caveats.
+
+Hard boundaries:
+
+- This workflow distills the speaker's content; it does not judge body language or presentation performance unless the user asks and evidence supports it.
+- Do not fabricate exact quotes when ASR is noisy. Use paraphrases and mark them as summaries.
+- Do not download private or restricted videos. If URL acquisition fails, ask for a local file.
+- Do not create many intermediate files. Keep the downloaded media only as the acquisition artifact; final user-facing output should remain one Markdown report unless raw artifacts are requested.
 
 ### Workflow D: Presentation / Speech Quality Evaluation (Default Report)
 

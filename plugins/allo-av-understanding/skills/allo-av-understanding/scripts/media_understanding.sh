@@ -2,6 +2,7 @@
 set -euo pipefail
 
 BASE_URL="${AV_UNDERSTANDING_BASE_URL:-http://221.0.79.252:8090}"
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 DEFAULT_POLL_INTERVAL="${AV_UNDERSTANDING_POLL_INTERVAL:-5}"
 # "forever" means: keep polling until the job is done/failed, as long as the
 # service health check stays alive. A number means a hard foreground timeout.
@@ -13,9 +14,12 @@ usage() {
   cat <<USAGE
 Usage:
   $0 health
+  $0 extract-url "pasted share text or URL"
+  $0 download-url "pasted share text or URL" [output_dir]
   $0 upload /absolute/path/to/file.mp4
   $0 submit /absolute/path/to/file.mp4
   $0 analyze /absolute/path/to/file.mp4 [max_wait_sec|auto|forever]
+  $0 analyze-url "pasted share text or URL" [max_wait_sec|auto|forever] [output_dir]
   $0 recommend-wait /absolute/path/to/file.mp4
   $0 job JOB_ID
   $0 poll JOB_ID [interval_seconds] [max_wait_seconds|forever]
@@ -42,6 +46,8 @@ Exit codes:
   6  service health check failed BEFORE submission; aborted. DO NOT fall back to
      local/offline processing. No reliable result is possible while the remote
      service is down.
+  7  URL download failed or no supported downloader was found. Ask the user to
+     provide a local media file instead; do not perform local/offline analysis.
 USAGE
 }
 
@@ -102,6 +108,104 @@ elif d <= 60 * 60:
 else:
     print(0)
 PY
+}
+
+extract_first_url() {
+  local text="$1"
+  python3 - "$text" <<'PY'
+import re
+import sys
+
+text = sys.argv[1]
+match = re.search(r"https?://[^\s，。；、)）\]】>]+", text)
+if not match:
+    sys.exit(1)
+print(match.group(0))
+PY
+}
+
+is_douyin_url() {
+  local url="$1"
+  case "$url" in
+    *douyin.com*|*iesdouyin.com*|*snssdk.com*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+download_douyin_media() {
+  local url="$1"
+  local output_dir="$2"
+  python3 "$SCRIPT_DIR/douyin_download.py" "$url" -o "$output_dir"
+}
+
+download_url_media() {
+  local input="$1"
+  local output_dir="${2:-${TMPDIR:-/tmp}/allo-av-understanding-downloads}"
+  need_arg url_or_share_text "$input"
+  require_healthy
+
+  local url=""
+  if ! url="$(extract_first_url "$input")"; then
+    echo "no URL found in input" >&2
+    return 1
+  fi
+
+  if is_douyin_url "$url"; then
+    if downloaded="$(download_douyin_media "$url" "$output_dir")"; then
+      printf '%s\n' "$downloaded"
+      return 0
+    fi
+    echo "direct Douyin downloader failed. Ask the user to provide a local video file." >&2
+    return 7
+  fi
+
+  echo "only Douyin public share URLs are supported by download-url/analyze-url. Provide a local media file for other platforms." >&2
+  return 7
+}
+
+analyze_file() {
+  local file="$1"
+  local max_wait_arg="${2:-auto}"
+  need_arg file "$file"
+
+  local duration=""
+  local soft_budget=""
+  local max_wait="forever"
+  local wait_policy="forever"
+  if [ "$max_wait_arg" = "auto" ]; then
+    if duration="$(media_duration_seconds "$file")"; then
+      soft_budget="$(recommended_wait_seconds "$duration")"
+      wait_policy="forever_with_soft_budget"
+    fi
+  elif [ "$max_wait_arg" = "forever" ]; then
+    wait_policy="forever"
+  else
+    max_wait="$max_wait_arg"
+    wait_policy="explicit_hard_timeout"
+  fi
+
+  result="$(upload_file "$file")"
+  printf '%s\n' "$result"
+  job_id="$(printf '%s' "$result" | json_get job_id)"
+  if [ -z "$job_id" ]; then
+    echo "upload did not return job_id" >&2
+    exit 1
+  fi
+
+  if [ "$soft_budget" = "0" ]; then
+    json_event event submitted_long_video job_id "$job_id" duration_seconds "${duration:-__NONE__}" hint "Video is longer than 60 minutes; do not wait in foreground. Resume later with: bash scripts/media_understanding.sh wait $job_id forever 10"
+    exit 0
+  fi
+
+  json_event event wait_budget job_id "$job_id" wait_policy "$wait_policy" duration_seconds "${duration:-__NONE__}" soft_budget_seconds "${soft_budget:-__NONE__}" max_wait "$max_wait" poll_interval_seconds "$DEFAULT_POLL_INTERVAL"
+  if poll_job "$job_id" "$DEFAULT_POLL_INTERVAL" "$max_wait" "$soft_budget"; then
+    json_event event ready next "summary,timeline,qa" job_id "$job_id"
+    curl -sS --connect-timeout 10 --max-time 120 "$BASE_URL/api/jobs/$job_id/summary"
+  else
+    code=$?
+    json_event event not_ready job_id "$job_id" exit_code "$code" hint "Resume with: bash scripts/media_understanding.sh wait $job_id forever 5 or check status with: bash scripts/media_understanding.sh job $job_id"
+    exit "$code"
+  fi
 }
 
 service_alive() {
@@ -233,6 +337,16 @@ except Exception:
       exit 6
     fi
     ;;
+  extract-url)
+    input="${2:-}"
+    need_arg url_or_share_text "$input"
+    extract_first_url "$input"
+    ;;
+  download-url)
+    input="${2:-}"
+    output_dir="${3:-${TMPDIR:-/tmp}/allo-av-understanding-downloads}"
+    download_url_media "$input" "$output_dir"
+    ;;
   upload|submit)
     file="${2:-}"
     upload_file "$file"
@@ -254,47 +368,15 @@ except Exception:
   analyze)
     file="${2:-}"
     max_wait_arg="${3:-auto}"
-    need_arg file "$file"
-
-    duration=""
-    soft_budget=""
-    max_wait="forever"
-    wait_policy="forever"
-    if [ "$max_wait_arg" = "auto" ]; then
-      if duration="$(media_duration_seconds "$file")"; then
-        soft_budget="$(recommended_wait_seconds "$duration")"
-        wait_policy="forever_with_soft_budget"
-      fi
-    elif [ "$max_wait_arg" = "forever" ]; then
-      wait_policy="forever"
-    else
-      max_wait="$max_wait_arg"
-      wait_policy="explicit_hard_timeout"
-    fi
-
-    result="$(upload_file "$file")"
-    printf '%s\n' "$result"
-    job_id="$(printf '%s' "$result" | json_get job_id)"
-    if [ -z "$job_id" ]; then
-      echo "upload did not return job_id" >&2
-      exit 1
-    fi
-
-    if [ "$soft_budget" = "0" ]; then
-      # Video longer than 60 minutes: do not block the foreground at all.
-      json_event event submitted_long_video job_id "$job_id" duration_seconds "${duration:-__NONE__}" hint "Video is longer than 60 minutes; do not wait in foreground. Resume later with: bash scripts/media_understanding.sh wait $job_id forever 10"
-      exit 0
-    fi
-
-    json_event event wait_budget job_id "$job_id" wait_policy "$wait_policy" duration_seconds "${duration:-__NONE__}" soft_budget_seconds "${soft_budget:-__NONE__}" max_wait "$max_wait" poll_interval_seconds "$DEFAULT_POLL_INTERVAL"
-    if poll_job "$job_id" "$DEFAULT_POLL_INTERVAL" "$max_wait" "$soft_budget"; then
-      json_event event ready next "summary,timeline,qa" job_id "$job_id"
-      curl -sS --connect-timeout 10 --max-time 120 "$BASE_URL/api/jobs/$job_id/summary"
-    else
-      code=$?
-      json_event event not_ready job_id "$job_id" exit_code "$code" hint "Resume with: bash scripts/media_understanding.sh wait $job_id forever 5 or check status with: bash scripts/media_understanding.sh job $job_id"
-      exit "$code"
-    fi
+    analyze_file "$file" "$max_wait_arg"
+    ;;
+  analyze-url)
+    input="${2:-}"
+    max_wait_arg="${3:-auto}"
+    output_dir="${4:-${TMPDIR:-/tmp}/allo-av-understanding-downloads}"
+    file="$(download_url_media "$input" "$output_dir")"
+    json_event event downloaded_media file "$file"
+    analyze_file "$file" "$max_wait_arg"
     ;;
   job)
     job_id="${2:-}"
